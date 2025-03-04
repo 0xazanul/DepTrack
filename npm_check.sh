@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # GitHub Organization Name
-ORG_NAME="enter_your_org_name_here"
+ORG_NAME="orgname"
 
 # GitHub API URL for listing repos
 API_URL="https://api.github.com/orgs/$ORG_NAME/repos"
@@ -9,44 +9,78 @@ API_URL="https://api.github.com/orgs/$ORG_NAME/repos"
 # Create a directory to store package.json files
 mkdir -p package_jsons
 
-# Fetch the list of repositories in the Formio organization
-echo "[+] Fetching repositories from GitHub Org: $ORG_NAME"
-repos=$(gh api $API_URL --jq '.[].full_name' 2>/dev/null)
+# Function to fetch repository information with pagination
+fetch_repos() {
+    # Try GitHub CLI first with pagination
+    local repos_info
+    if command -v gh &>/dev/null; then
+        repos_info=$(gh api --paginate "$API_URL" --jq '.[] | [.full_name, .default_branch] | @tsv' 2>/dev/null)
+    fi
+    
+    # Fallback to curl if gh failed or not available
+    if [[ -z "$repos_info" ]]; then
+        echo "[!] Using curl to fetch repositories (may be slower)..."
+        local page=1
+        while :; do
+            local page_url="$API_URL?page=$page&per_page=100"
+            local response
+            response=$(curl -s -H "Accept: application/vnd.github.v3+json" "$page_url")
+            if [[ -z "$response" || "$response" == "[]" ]]; then
+                break
+            fi
+            repos_info+=$'\n'$(echo "$response" | jq -r '.[] | [.full_name, .default_branch] | @tsv' 2>/dev/null)
+            ((page++))
+        done
+        # Remove empty lines
+        repos_info=$(echo "$repos_info" | sed '/^$/d')
+    fi
+    
+    echo "$repos_info"
+}
 
-# If GitHub CLI fails, fallback to curl
-if [[ -z "$repos" ]]; then
-    echo "[!] GitHub CLI failed, trying curl..."
-    repos=$(curl -s "$API_URL" | jq -r '.[].full_name')
+# Fetch repository information
+echo "[+] Fetching repositories from GitHub Org: $ORG_NAME"
+repos_info=$(fetch_repos)
+
+# Check if we got any repositories
+if [[ -z "$repos_info" ]]; then
+    echo "[!] Error: No repositories found or failed to fetch data"
+    exit 1
 fi
 
-# Loop through each repository and fetch package.json
-for repo in $repos; do
-    echo "[+] Checking repo: $repo"
+# Process repositories
+echo "$repos_info" | while IFS=$'\t' read -r repo default_branch; do
+    echo "[+] Checking repo: $repo (default branch: $default_branch)"
+    raw_url="https://raw.githubusercontent.com/$repo/$default_branch/package.json"
+    output_file="package_jsons/${repo//\//_}.json"
 
-    # Possible branches to check (some repos use 'main', some 'master', etc.)
-    for branch in main master develop; do
-        raw_url="https://raw.githubusercontent.com/$repo/$branch/package.json"
+    # Try to download package.json
+    if curl -s -f -o "$output_file" "$raw_url"; then
+        echo "[+] Successfully downloaded package.json"
+    else
+        echo "[!] Failed to download package.json"
+        # Remove empty file if created
+        [[ -f "$output_file" ]] && rm "$output_file"
+    fi
+done
 
-        # Try to download package.json
-        curl -s -f -o "package_jsons/${repo//\//_}.json" "$raw_url"
-        if [[ $? -eq 0 ]]; then
-            echo "[+] Found package.json in $repo ($branch)"
-            break  # Stop checking branches if found
+# Check dependencies on npm
+echo "[+] Checking dependencies on npm..."
+
+for file in package_jsons/*.json; do
+    # Skip if not a regular file or empty
+    [[ ! -f "$file" || ! -s "$file" ]] && continue
+    
+    echo "[+] Processing $file"
+    
+    # Extract dependencies and check them
+    jq -r '(.dependencies // {}) + (.devDependencies // {}) | keys[]' "$file" 2>/dev/null | while read -r pkg; do
+        if npm view "$pkg" &>/dev/null; then
+            echo -e "  \033[32m✔ $pkg exists on npm\033[0m"
+        else
+            echo -e "  \033[31m✖ $pkg NOT FOUND on npm\033[0m"
         fi
     done
 done
 
-# Check all dependencies on npm
-echo "[+] Checking dependencies on npm..."
-
-for file in package_jsons/*.json; do
-    echo "[+] Processing $file"
-
-    # Extract dependencies and devDependencies
-    packages=$(jq -r '.dependencies,.devDependencies | keys[]?' "$file" 2>/dev/null)
-
-    # Check each package on npm
-    for pkg in $packages; do
-        npm view "$pkg" &>/dev/null && echo "$pkg exists on npm" || echo "$pkg NOT FOUND on npm"
-    done
-done
+echo "[+] Script completed"
